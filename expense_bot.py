@@ -116,7 +116,6 @@ KNOWN_EXPENSES = {
     "пвк": "ооо пвк (котельная)",
     "котельная": "ооо пвк (котельная)",
     "ленэнерго": "ленэнерго",
-    "электромонтаж": "электромонтаж",
     "денис": "денис инженерка",
 }
 
@@ -212,7 +211,13 @@ def append_to_sheet(data: Dict[str, Any]) -> str:
         data["source"],
     ]
 
-    worksheet.append_row(row_data, value_input_option="USER_ENTERED")
+    # FIX: Используем явную вставку по диапазону вместо append_row
+    # append_row() мог перезаписывать последнюю строку при определённых условиях
+    worksheet.update(
+        f"A{next_row}:H{next_row}",
+        [row_data],
+        value_input_option="USER_ENTERED",
+    )
     return f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit"
 
 
