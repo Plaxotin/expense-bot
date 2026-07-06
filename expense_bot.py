@@ -3,8 +3,10 @@ Telegram Bot для учёта расходов строителя
 Стек: Yandex SpeechKit + Google Sheets API + Timeweb Cloud
 
 Структура таблицы:
-A: Идентификатор | B: Дата | C: Кто внёс | D: Проект | 
+A: Идентификатор | B: Дата | C: Кто внёс | D: Проект |
 E: Статья расхода | F: Сумма | G: Тип расхода | H: От кого деньги
+
+NEW: Динамические справочники — пользователь может добавлять статьи и имена
 """
 
 import os
@@ -17,11 +19,13 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 # === TELEGRAM ===
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
     filters,
     ContextTypes,
 )
@@ -32,19 +36,17 @@ from google.oauth2.service_account import Credentials
 
 # ============ КОНФИГУРАЦИЯ ============
 
-# TELEGRAM — получить у @BotFather
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+YANDEX_FOLDER_ID = "YOUR_FOLDER_ID_HERE"
+YANDEX_IAM_TOKEN = "YOUR_IAM_TOKEN_HERE"
+YANDEX_API_KEY = "YOUR_API_KEY_HERE"
 
-# YANDEX SPEECHKIT — получить в Yandex Cloud
-YANDEX_FOLDER_ID = "YOUR_FOLDER_ID_HERE"      # ID каталога в Yandex Cloud
-YANDEX_IAM_TOKEN = "YOUR_IAM_TOKEN_HERE"      # IAM-токен (обновляется каждые 12 часов)
-# ИЛИ используй API-ключ (постоянный):
-YANDEX_API_KEY = "YOUR_API_KEY_HERE"          # API-ключ SpeechKit (рекомендуется)
-
-# GOOGLE SHEETS
 SPREADSHEET_ID = "14qWku1XABkZUXeQhNwc8RDKushljf1OofN7cUSDYMKk"
 SHEET_NAME = "Учёт"
 GOOGLE_CREDENTIALS_FILE = "credentials.json"
+
+CUSTOM_EXPENSES_FILE = "custom_expenses.json"
+CUSTOM_NAMES_FILE = "custom_names.json"
 
 # ============ НАСТРОЙКА ЛОГИРОВАНИЯ ============
 
@@ -54,10 +56,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============ СЛОВАРЬ СТАТЕЙ РАСХОДА ============
+# ============ СОСТОЯНИЯ РАЗГОВОРА ============
+
+ASKING_EXPENSE, ASKING_NAME = range(2)
+
+# ============ СПРАВОЧНИКИ ============
 
 KNOWN_EXPENSES = {
-    # Материалы
     "газобетон": "Покупка Газобетона",
     "песок": "Покупка Песка",
     "арматура": "Покупка Арматуры",
@@ -67,7 +72,6 @@ KNOWN_EXPENSES = {
     "материалы": "Покупка прочих материалов",
     "проект": "Покупка проекта",
     "инженерка": "Покупка Проекта Инженерка",
-    # Работы и услуги
     "петрович": "Заказ Петрович",
     "зп": "Зп Рабочим",
     "зарплата": "Зп Рабочим",
@@ -83,18 +87,14 @@ KNOWN_EXPENSES = {
     "двери": "Установка двери",
     "окна": "Замер Окон",
     "окно": "Замер Окон",
-    # Доставка и вывоз
     "бытовка": "Доставка бытовки",
     "грунт": "Увоз грунта с участка",
     "бетон": "Бетон с доставкой",
-    # Участок
     "участок": "Покупка участка",
-    # Прочее
     "сим-карта": "Покупка Сим-Карты",
     "сим карта": "Покупка Сим-Карты",
     "камера": "Покупка Камеры С Картой",
     "вимос": "Покупка в ВИМОсе",
-    # Из видео (д. Горки-Лэнд 2)
     "панели": "Панели",
     "доставка дверей": "Доставка дверей",
     "монтаж электрики": "Монтаж электрики",
@@ -107,7 +107,6 @@ KNOWN_EXPENSES = {
     "кухня": "Сборка кухни",
     "аванс": "Оплата З/П Аванс",
     "оплата зп": "Зп Рабочим",
-    # Поставщики
     "атлант": "ооо гк атлант",
     "тензор": "тензор",
     "полякова": "полякова ип",
@@ -118,8 +117,6 @@ KNOWN_EXPENSES = {
     "ленэнерго": "ленэнерго",
     "денис": "денис инженерка",
 }
-
-# ============ СЛОВАРЬ ИМЁН ============
 
 NAME_FORMS = {
     "васи": "Вася", "вася": "Вася", "василию": "Вася", "василий": "Вася",
@@ -135,15 +132,50 @@ NAME_FORMS = {
     "дениса": "Денис", "денис": "Денис",
 }
 
+# ============ ДИНАМИЧЕСКИЕ СПРАВОЧНИКИ ============
+
+def load_custom_dict(filepath: str) -> dict:
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def save_custom_dict(filepath: str, data: dict):
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+CUSTOM_EXPENSES = load_custom_dict(CUSTOM_EXPENSES_FILE)
+CUSTOM_NAMES = load_custom_dict(CUSTOM_NAMES_FILE)
+
+MERGED_EXPENSES = {**KNOWN_EXPENSES, **CUSTOM_EXPENSES}
+MERGED_NAMES = {**NAME_FORMS, **CUSTOM_NAMES}
+
+
+def add_custom_expense(trigger: str, display_name: str):
+    global MERGED_EXPENSES, CUSTOM_EXPENSES
+    trigger_clean = trigger.lower().strip()
+    CUSTOM_EXPENSES[trigger_clean] = display_name
+    MERGED_EXPENSES[trigger_clean] = display_name
+    save_custom_dict(CUSTOM_EXPENSES_FILE, CUSTOM_EXPENSES)
+
+
+def add_custom_name(trigger: str, display_name: str):
+    global MERGED_NAMES, CUSTOM_NAMES
+    trigger_clean = trigger.lower().strip()
+    CUSTOM_NAMES[trigger_clean] = display_name
+    MERGED_NAMES[trigger_clean] = display_name
+    save_custom_dict(CUSTOM_NAMES_FILE, CUSTOM_NAMES)
+
+
 # ============ YANDEX SPEECHKIT ============
 
 def transcribe_with_yandex(audio_path: str) -> str:
-    """
-    Распознаёт аудио через Yandex SpeechKit.
-    Поддерживает OGG (Opus) — формат Telegram голосовых.
-    """
     url = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
-
     headers = {}
     if YANDEX_API_KEY:
         headers["Authorization"] = f"Api-Key {YANDEX_API_KEY}"
@@ -153,18 +185,12 @@ def transcribe_with_yandex(audio_path: str) -> str:
     params = {
         "folderId": YANDEX_FOLDER_ID,
         "lang": "ru-RU",
-        "format": "oggopus",  # Telegram voice = OGG Opus
+        "format": "oggopus",
         "sampleRateHertz": "48000",
     }
 
     with open(audio_path, "rb") as audio_file:
-        response = requests.post(
-            url,
-            headers=headers,
-            params=params,
-            data=audio_file,
-            timeout=30
-        )
+        response = requests.post(url, headers=headers, params=params, data=audio_file, timeout=30)
 
     response.raise_for_status()
     result = response.json()
@@ -184,9 +210,7 @@ def get_sheets_client():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_file(
-        GOOGLE_CREDENTIALS_FILE, scopes=scopes
-    )
+    creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=scopes)
     return gspread.authorize(creds)
 
 
@@ -198,10 +222,19 @@ def append_to_sheet(data: Dict[str, Any]) -> str:
     all_values = worksheet.get_all_values()
     next_row = len(all_values) + 1
 
+    ids = []
+    for row in all_values[1:]:
+        if row and row[0].strip():
+            try:
+                ids.append(int(row[0]))
+            except (ValueError, IndexError):
+                pass
+    row_id = max(ids) + 1 if ids else 1
+
     excel_date = excel_date_from_string(data["date"])
 
     row_data = [
-        next_row - 1,
+        row_id,
         excel_date,
         data["user"],
         data["project"],
@@ -211,8 +244,6 @@ def append_to_sheet(data: Dict[str, Any]) -> str:
         data["source"],
     ]
 
-    # FIX: Используем явную вставку по диапазону вместо append_row
-    # append_row() мог перезаписывать последнюю строку при определённых условиях
     worksheet.update(
         f"A{next_row}:H{next_row}",
         [row_data],
@@ -281,13 +312,13 @@ def extract_source(text: str) -> Optional[str]:
         match = re.search(pattern, text)
         if match:
             name = match.group(1)
-            return NAME_FORMS.get(name.lower(), name)
+            return MERGED_NAMES.get(name.lower(), name)
     return None
 
 
 def extract_expense(text: str) -> Optional[str]:
     text_lower = text.lower()
-    for key, value in KNOWN_EXPENSES.items():
+    for key, value in MERGED_EXPENSES.items():
         if key in text_lower:
             return value
     match = re.search(r'(?:на|за)\s+([а-я\s]+?)(?:\s+\d|$)', text_lower)
@@ -328,32 +359,226 @@ def parse_voice_text(text: str) -> Dict[str, Any]:
     return result
 
 
+# ============ УТОЧНЕНИЕ ДАННЫХ ============
+
+async def ask_for_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_text = context.user_data.get("raw_text", "")
+    expense_guess = re.search(r'(?:на|за)\s+([а-я\s]+?)(?:\s+\d|$)', raw_text.lower())
+    guess = expense_guess.group(1).strip() if expense_guess else ""
+
+    keyboard = [
+        [InlineKeyboardButton("✏️ Ввести вручную", callback_data="expense_manual")],
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="expense_skip")],
+    ]
+
+    text_parts = [
+        "🤔 Я не понял, на что потрачены деньги.\n",
+        f'📝 Текст: "{raw_text}"\n',
+    ]
+    if guess:
+        text_parts.append(f"💡 Предположение: {guess}\n")
+    else:
+        text_parts.append("💡 Предположение: (не удалось угадать)\n")
+    text_parts.append("\nВыбери действие:")
+
+    msg = "\n".join(text_parts)
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            msg, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(
+            msg, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    return ASKING_EXPENSE
+
+
+async def ask_for_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw_text = context.user_data.get("raw_text", "")
+    name_guess = None
+    patterns = [
+        r'(?:от|дал[аи]?)\s+([А-Я][а-я]+)',
+        r'([А-Я][а-я]+)\s+(?:дал|перевёл|перевел)',
+    ]
+    for p in patterns:
+        m = re.search(p, raw_text)
+        if m:
+            name_guess = m.group(1)
+            break
+
+    keyboard = [
+        [InlineKeyboardButton("✏️ Ввести вручную", callback_data="name_manual")],
+        [InlineKeyboardButton("⏭ Пропустить", callback_data="name_skip")],
+    ]
+
+    text_parts = [
+        "🤔 Я не понял, кто дал деньги.\n",
+        f'📝 Текст: "{raw_text}"\n',
+    ]
+    if name_guess:
+        text_parts.append(f"💡 Предположение: {name_guess}\n")
+    else:
+        text_parts.append("💡 Предположение: (не удалось угадать)\n")
+    text_parts.append("\nВыбери действие:")
+
+    msg = "\n".join(text_parts)
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            msg, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(
+            msg, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    return ASKING_NAME
+
+
+async def handle_expense_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "expense_manual":
+        await query.edit_message_text(
+            "✏️ Напиши название статьи расхода одним сообщением:\n"
+            "Например: Покупка плитки или Плиточные работы"
+        )
+        return ASKING_EXPENSE
+
+    elif query.data == "expense_skip":
+        context.user_data["expense"] = "(не распознано)"
+        if context.user_data.get("source") is None:
+            return await ask_for_name(update, context)
+        return await finalize_entry(update, context)
+
+    return ConversationHandler.END
+
+
+async def handle_name_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "name_manual":
+        await query.edit_message_text(
+            "✏️ Напиши имя человека:\n"
+            "Например: Михаил"
+        )
+        return ASKING_NAME
+
+    elif query.data == "name_skip":
+        context.user_data["source"] = "(не распознано)"
+        return await finalize_entry(update, context)
+
+    return ConversationHandler.END
+
+
+async def receive_expense_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    trigger = text.lower()
+    add_custom_expense(trigger, text)
+
+    context.user_data["expense"] = text
+    logger.info(f"Добавлена статья расхода: {trigger} -> {text}")
+
+    await update.message.reply_text(f"✅ Добавил статью: {text}")
+
+    if context.user_data.get("source") is None:
+        return await ask_for_name(update, context)
+    return await finalize_entry(update, context)
+
+
+async def receive_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    trigger = text.lower()
+    add_custom_name(trigger, text)
+
+    context.user_data["source"] = text
+    logger.info(f"Добавлено имя: {trigger} -> {text}")
+
+    await update.message.reply_text(f"✅ Добавил имя: {text}")
+    return await finalize_entry(update, context)
+
+
+async def finalize_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.user_data
+
+    user = data.get("tg_user")
+    if user.username:
+        data["user"] = f"{user.first_name} (@{user.username})"
+    else:
+        data["user"] = user.first_name
+
+    try:
+        sheet_url = append_to_sheet(data)
+        amount_display = f"{data['amount']:,.0f}".replace(",", " ")
+
+        response = (
+            f"✅ Добавил запись:\n"
+            f"📅 Дата: {data['date']}\n"
+            f"📋 Расход: {data['expense']}\n"
+            f"💰 Сумма: {amount_display} руб.\n"
+            f"💳 Тип: {data['payment_type']}\n"
+            f"👤 От кого деньги: {data['source']}\n"
+            f"🏗 Проект: {data['project']}\n\n"
+            f"🔗 Ссылка на таблицу: {sheet_url}"
+        )
+
+        if update.callback_query:
+            await update.callback_query.edit_message_text(response)
+        else:
+            await update.message.reply_text(response)
+
+    except Exception as e:
+        logger.error(f"Ошибка записи: {e}")
+        msg = f"❌ Ошибка при записи в таблицу: {str(e)}"
+        if update.callback_query:
+            await update.callback_query.edit_message_text(msg)
+        else:
+            await update.message.reply_text(msg)
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Отменено.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
 # ============ TELEGRAM HANDLERS ============
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome = (
         "👋 Привет! Я бот для учёта расходов строителя.\n\n"
         "🎤 Отправь голосовое с данными о расходе.\n"
-        "Пример: *\"Вася дал 5 миллионов безналом на панели\"*\n\n"
+        'Пример: "Вася дал 5 миллионов безналом на панели"\n\n'
         "📋 Обязательно укажи:\n"
-        "1️⃣ Сумму\n2️⃣ Тип платежа\n3️⃣ Кто дал деньги\n4️⃣ Статью расхода"
+        "1️⃣ Сумму\n2️⃣ Тип платежа\n3️⃣ Кто дал деньги\n4️⃣ Статью расхода\n\n"
+        "💡 Если я не знаю какую-то статью или имя — спрошу и запомню!"
     )
-    await update.message.reply_text(welcome, parse_mode="Markdown")
+    await update.message.reply_text(welcome)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "📖 *Как пользоваться:*\n\n"
+        "📖 Как пользоваться:\n\n"
         "Запиши голосовое со всеми данными:\n"
-        "• Сумма: *30 миллионов*, *500 тыс*, *5000000*\n"
-        "• Тип: *наличные* / *безнал*\n"
-        "• Кто: *Вася*, *Петрович*, *Сергей*, *Юра* и т.д.\n"
-        "• На что: *панели*, *арматура*, *зп рабочим* и т.д.\n\n"
-        "Примеры:\n"
-        "• *\"Вася перевёл 5 млн безналом на панели\"*\n"
-        "• *\"Сергей дал 600 тыс наличка на зп рабочим\"*"
+        "• Сумма: 30 миллионов, 500 тыс, 5000000\n"
+        "• Тип: наличные / безнал\n"
+        "• Кто: Вася, Петрович, Сергей, Юра и т.д.\n"
+        "• На что: панели, арматура, зп рабочим и т.д.\n\n"
+        "Если я не знаю статью или имя — предложу добавить!\n\n"
+        'Примеры:\n'
+        '• "Вася перевёл 5 млн безналом на панели"\n'
+        '• "Сергей дал 600 тыс наличка на зп рабочим"'
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await update.message.reply_text(help_text)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,39 +592,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ogg_path = tmp.name
 
     try:
-        # Распознаём через Yandex SpeechKit
         text = transcribe_with_yandex(ogg_path)
         logger.info(f"Распознан текст от {user.username}: {text}")
-
-        data = parse_voice_text(text)
-
-        if data["missing"]:
-            missing_str = "\n".join(data["missing"])
-            response = (
-                "❌ *Запись не внесена!*\n"
-                "Я что-то не понял или не хватает данных.\n\n"
-                "⚠️ *Надо обязательно указать:*\n"
-                f"{missing_str}\n\n"
-                f"📝 *Я услышал:* \"{text}\""
-            )
-            await update.message.reply_text(response, parse_mode="Markdown")
-        else:
-            data["user"] = f"{user.first_name} (@{user.username})" if user.username else user.first_name
-            sheet_url = append_to_sheet(data)
-
-            amount_display = f"{data['amount']:,.0f}".replace(",", " ")
-
-            response = (
-                "✅ *Добавил запись:*\n"
-                f"📅 Дата: {data['date']}\n"
-                f"📋 Расход: {data['expense']}\n"
-                f"💰 Сумма: {amount_display} руб.\n"
-                f"💳 Тип: {data['payment_type']}\n"
-                f"👤 От кого деньги: {data['source']}\n"
-                f"🏗 Проект: {data['project']}\n\n"
-                f"🔗 [Ссылка на таблицу]({sheet_url})"
-            )
-            await update.message.reply_text(response, parse_mode="Markdown")
+        await process_input(update, context, text, user)
 
     except requests.exceptions.HTTPError as e:
         logger.error(f"Yandex API error: {e.response.text}")
@@ -409,9 +604,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"Ошибка: {e}")
-        await update.message.reply_text(
-            f"❌ Ошибка: {str(e)}\nПопробуй ещё раз."
-        )
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}\nПопробуй ещё раз.")
     finally:
         os.remove(ogg_path)
 
@@ -420,35 +613,46 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     await update.message.chat.send_action(action="typing")
+    await process_input(update, context, text, user)
 
-    try:
-        data = parse_voice_text(text)
-        if data["missing"]:
-            missing_str = "\n".join(data["missing"])
-            response = (
-                "❌ *Запись не внесена!*\n"
-                "⚠️ *Надо обязательно указать:*\n"
-                f"{missing_str}"
-            )
-            await update.message.reply_text(response, parse_mode="Markdown")
-        else:
-            data["user"] = f"{user.first_name} (@{user.username})" if user.username else user.first_name
-            sheet_url = append_to_sheet(data)
-            amount_display = f"{data['amount']:,.0f}".replace(",", " ")
-            response = (
-                "✅ *Добавил запись:*\n"
-                f"📅 Дата: {data['date']}\n"
-                f"📋 Расход: {data['expense']}\n"
-                f"💰 Сумма: {amount_display} руб.\n"
-                f"💳 Тип: {data['payment_type']}\n"
-                f"👤 От кого деньги: {data['source']}\n"
-                f"🏗 Проект: {data['project']}\n\n"
-                f"🔗 [Ссылка на таблицу]({sheet_url})"
-            )
-            await update.message.reply_text(response, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+async def process_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, user):
+    data = parse_voice_text(text)
+
+    critical_missing = []
+    if data["amount"] is None:
+        critical_missing.append("1) Сумму")
+    if data["payment_type"] is None:
+        critical_missing.append("2) Тип платежа (наличные или безналичные)")
+
+    if critical_missing:
+        missing_str = "\n".join(critical_missing)
+        response = (
+            "❌ Запись не внесена!\n"
+            "Я не понял или не хватает критичных данных.\n\n"
+            "⚠️ Надо обязательно указать:\n"
+            f"{missing_str}\n\n"
+            f'📝 Я услышал: "{text}"'
+        )
+        await update.message.reply_text(response)
+        return
+
+    context.user_data["date"] = data["date"]
+    context.user_data["amount"] = data["amount"]
+    context.user_data["payment_type"] = data["payment_type"]
+    context.user_data["project"] = data["project"]
+    context.user_data["expense"] = data["expense"]
+    context.user_data["source"] = data["source"]
+    context.user_data["raw_text"] = text
+    context.user_data["tg_user"] = user
+
+    if data["expense"] is None:
+        return await ask_for_expense(update, context)
+
+    if data["source"] is None:
+        return await ask_for_name(update, context)
+
+    return await finalize_entry(update, context)
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -462,13 +666,30 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.VOICE, handle_voice),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
+        ],
+        states={
+            ASKING_EXPENSE: [
+                CallbackQueryHandler(handle_expense_callback, pattern="^expense_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_expense_text),
+            ],
+            ASKING_NAME: [
+                CallbackQueryHandler(handle_name_callback, pattern="^name_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(conv_handler)
     application.add_error_handler(error_handler)
 
-    logger.info("Бот запущен! (Yandex SpeechKit + Google Sheets)")
+    logger.info("Бот запущен! (Yandex SpeechKit + Google Sheets + Dynamic Dicts)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
